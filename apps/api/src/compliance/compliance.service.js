@@ -207,11 +207,28 @@ const startKycVerification = async ({ user, applicant }) => {
   return prisma.kycProfile.findUnique({ where: { id: profile.id } });
 };
 
+const {
+  KYC_STATUSES,
+  SANCTIONS_STATUSES,
+  CUSTODY_STATUSES,
+  RISK_THRESHOLDS,
+  classifyRiskScore,
+  evaluateKycDecision,
+  getActivityLimits,
+  syncKycAndRiskState,
+  enforceWalletActivityLimit,
+} = require('./kycDecision.service');
+
 const callbackDecision = (resultCode) => {
-  if (['1020', '1021'].includes(String(resultCode))) return { status: 'approved', tier: 1, deniedReason: null };
-  if (String(resultCode) === '1022') return { status: 'rejected', tier: 0, deniedReason: 'Identity details did not match' };
-  return { status: 'review', tier: 0, deniedReason: 'Provider result requires manual review' };
+  const decision = evaluateKycDecision({ providerResultCode: resultCode });
+  return {
+    status: decision.status,
+    tier: decision.tier,
+    deniedReason: decision.reason,
+  };
 };
+
+const cryptoHash = (value) => require('crypto').createHash('sha256').update(value).digest('hex');
 
 const processSmileIdCallback = async (payload) => {
   if (!smileId.verifyCallback({ signature: payload.signature, timestamp: payload.timestamp })) {
@@ -250,33 +267,26 @@ const processSmileIdCallback = async (payload) => {
           resultCode: String(payload.ResultCode),
         },
       });
-      const updated = await tx.kycProfile.update({
-        where: { id: profile.id },
-        data: {
-          ...decision,
-          riskScore: decision.status === 'approved' ? profile.riskScore : Math.max(profile.riskScore, 50),
-          metadata: {
-            resultCode: String(payload.ResultCode),
-            resultText: String(payload.ResultText || ''),
-            smileJobId: String(payload.SmileJobID || ''),
-            verifiedAt: new Date().toISOString(),
-          },
+
+      const nextRiskScore = decision.status === KYC_STATUSES.APPROVED ? profile.riskScore : Math.max(profile.riskScore, 50);
+
+      const updated = await syncKycAndRiskState({
+        userId: profile.userId,
+        tier: decision.tier,
+        status: decision.status,
+        riskScore: nextRiskScore,
+        deniedReason: decision.deniedReason,
+        metadata: {
+          resultCode: String(payload.ResultCode),
+          resultText: String(payload.ResultText || ''),
+          smileJobId: String(payload.SmileJobID || ''),
+          verifiedAt: new Date().toISOString(),
         },
+        actorType: 'provider',
+        actorId: 'smileid',
+        tx,
       });
-      await tx.user.update({
-        where: { id: profile.userId },
-        data: { kycTier: updated.tier, riskScore: updated.riskScore },
-      });
-      await tx.auditLog.create({
-        data: {
-          actorType: 'provider',
-          actorId: 'smileid',
-          action: 'kyc.callback.processed',
-          entityType: 'KycProfile',
-          entityId: profile.id,
-          metadata: { resultCode: String(payload.ResultCode), status: updated.status },
-        },
-      });
+
       return updated;
     });
     logger.info('kyc_callback_processed', { profileId: result.id, status: result.status, resultCode: String(payload.ResultCode) });
@@ -290,7 +300,8 @@ const processSmileIdCallback = async (payload) => {
   }
 };
 
-const cryptoHash = (value) => require('crypto').createHash('sha256').update(value).digest('hex');
+// eslint-disable-next-line no-unused-vars
+const getPolicyCurrency = policyCurrency;
 
 const calculateRiskScore = ({ amount, asset, routeType, destinationCountry, profileRiskScore = 0 }) => {
   const riskAsset = asset || policyCurrency();
@@ -304,12 +315,13 @@ const calculateRiskScore = ({ amount, asset, routeType, destinationCountry, prof
   return Math.min(score, 100);
 };
 
+// eslint-disable-next-line no-unused-vars
 const normalizeCountry = (country) => String(country || '').trim().toUpperCase();
 
 // Build screening subjects for a transaction
 const buildScreeningSubjects = ({ user, destinationCountry, recipientPhoneNumber, destination }) => {
   const subjects = [];
-  
+
   // Customer (sender)
   subjects.push({
     id: `customer:${user.id}`,
@@ -321,7 +333,7 @@ const buildScreeningSubjects = ({ user, destinationCountry, recipientPhoneNumber
       userId: String(user.id),
     },
   });
-  
+
   // Recipient (if phone number provided)
   if (recipientPhoneNumber) {
     subjects.push({
@@ -334,7 +346,7 @@ const buildScreeningSubjects = ({ user, destinationCountry, recipientPhoneNumber
       },
     });
   }
-  
+
   // Destination address (if Stellar address provided)
   if (destination) {
     subjects.push({
@@ -347,10 +359,8 @@ const buildScreeningSubjects = ({ user, destinationCountry, recipientPhoneNumber
       },
     });
   }
-  
+
   // Destination country (for country-based screening when no specific recipient)
-  // This ensures sanctions screening works for cross-border payments even without
-  // a registered recipient phone number or Stellar address.
   if (destinationCountry && !recipientPhoneNumber && !destination) {
     subjects.push({
       id: `destination-country:${destinationCountry}`,
@@ -361,14 +371,15 @@ const buildScreeningSubjects = ({ user, destinationCountry, recipientPhoneNumber
       },
     });
   }
-  
+
   return subjects;
 };
 
 // Persist screening results with full audit trail
+// eslint-disable-next-line no-unused-vars
 const persistScreeningResults = async ({ profileId, subjects, results, tx }) => {
   const now = new Date();
-  
+
   for (const result of results) {
     await tx.sanctionsScreeningResult.create({
       data: {
@@ -385,15 +396,14 @@ const persistScreeningResults = async ({ profileId, subjects, results, tx }) => 
       },
     });
   }
-  
-  // Determine overall profile sanctions status from individual results
+
   const hasBlocked = results.some((r) => r.status === SCREENING_STATUS.BLOCKED);
   const hasReview = results.some((r) => r.status === SCREENING_STATUS.REVIEW);
-  
+
   let overallStatus = SCREENING_STATUS.CLEARED;
   if (hasBlocked) overallStatus = SCREENING_STATUS.BLOCKED;
   else if (hasReview) overallStatus = SCREENING_STATUS.REVIEW;
-  
+
   await tx.kycProfile.update({
     where: { id: profileId },
     data: {
@@ -402,46 +412,41 @@ const persistScreeningResults = async ({ profileId, subjects, results, tx }) => 
       lastScreenedAt: now,
     },
   });
-  
+
   return overallStatus;
 };
 
 // Main screening function using configured provider
+// eslint-disable-next-line no-unused-vars
 const screenSanctions = async ({ user, destinationCountry, routeType, recipientPhoneNumber, destination, tx = prisma }) => {
-  // Check if we have a recent cached result that's still valid
   const profile = await getOrCreateKycProfile(user);
-  const maxAgeMs = Number(config.compliance?.screeningMaxAgeMs || 24 * 60 * 60 * 1000); // 24 hours default
-  
+  const maxAgeMs = Number(config.compliance?.screeningMaxAgeMs || 24 * 60 * 60 * 1000);
+
   if (
     profile.sanctionsScreenedAt &&
     Date.now() - new Date(profile.sanctionsScreenedAt).getTime() < maxAgeMs &&
     profile.sanctionsStatus !== SCREENING_STATUS.REVIEW &&
     profile.sanctionsStatus !== SCREENING_STATUS.BLOCKED
   ) {
-    // Return cached result for cleared profiles within TTL
     return {
       status: profile.sanctionsStatus,
       reason: 'Previously cleared by compliance (cached).',
       cached: true,
     };
   }
-  
-  // Build subjects to screen
+
   const subjects = buildScreeningSubjects({ user, destinationCountry, recipientPhoneNumber, destination });
-  
+
   try {
-    // Call screening provider
     const screeningResult = await screeningProvider.screen({ subjects });
-    
-    // Persist results with audit trail
+
     const overallStatus = await persistScreeningResults({
       profileId: profile.id,
       subjects,
       results: screeningResult.results,
       tx,
     });
-    
-    // Log screening completion
+
     await tx.auditLog.create({
       data: {
         actorType: 'system',
@@ -462,7 +467,7 @@ const screenSanctions = async ({ user, destinationCountry, routeType, recipientP
         },
       },
     });
-    
+
     return {
       status: overallStatus,
       reason: screeningResult.results.find((r) => r.status !== SCREENING_STATUS.CLEARED)?.reason || 'Screening passed.',
@@ -475,12 +480,11 @@ const screenSanctions = async ({ user, destinationCountry, routeType, recipientP
       provider: screeningProvider.name,
       error: error.message,
     });
-    
-    // Fail-safe: if screening is unavailable and profile was previously cleared, allow with warning
+
     if (profile.sanctionsStatus === SCREENING_STATUS.CLEARED && profile.sanctionsScreenedAt) {
       const staleness = Date.now() - new Date(profile.sanctionsScreenedAt).getTime();
-      const maxStaleness = Number(config.compliance?.screeningMaxStalenessMs || 72 * 60 * 60 * 1000); // 72 hours
-      
+      const maxStaleness = Number(config.compliance?.screeningMaxStalenessMs || 72 * 60 * 60 * 1000);
+
       if (staleness < maxStaleness) {
         logger.warn('sanctions_screening_unavailable_using_stale_cleared', {
           profileId: profile.id,
@@ -494,13 +498,12 @@ const screenSanctions = async ({ user, destinationCountry, routeType, recipientP
         };
       }
     }
-    
-    // If no cached result or stale, fail safe to review (don't leak watchlist details)
+
     logger.warn('sanctions_screening_unavailable_fail_safe_review', {
       profileId: profile.id,
       provider: screeningProvider.name,
     });
-    
+
     return {
       status: SCREENING_STATUS.REVIEW,
       reason: 'Sanctions screening temporarily unavailable; manual review required.',
@@ -510,34 +513,19 @@ const screenSanctions = async ({ user, destinationCountry, routeType, recipientP
   }
 };
 
-// Legacy sync screenSanctions for backward compatibility (deprecated)
-const screenSanctionsLegacy = ({ destinationCountry, routeType }) => {
-  const country = normalizeCountry(destinationCountry);
-  if (country && SANCTIONS_BLOCKED_COUNTRIES.has(country)) {
-    return {
-      status: 'blocked',
-      reason: 'Destination country is subject to sanctions screening and cannot be served.',
-    };
-  }
-  if (country && SANCTIONS_REVIEW_COUNTRIES.has(country)) {
-    return {
-      status: 'review',
-      reason: 'Destination country is high-risk and requires manual sanctions review.',
-    };
-  }
-  if (routeType === 'cross_border') {
-    return {
-      status: 'review',
-      reason: 'Cross-border transfers require manual sanctions review before settlement.',
-    };
-  }
-  return {
-    status: 'cleared',
-    reason: 'Local screening passed.',
-  };
-};
-
-const enforceTransactionPolicy = async ({ user, amount, asset = 'NGN', routeType, destinationCountry, tx = prisma, now, fetchFiatRate, fetchCryptoUsdRate }) => {
+const enforceTransactionPolicy = async ({
+  user,
+  amount,
+  asset = 'NGN',
+  routeType,
+  destinationCountry,
+  recipientPhoneNumber,
+  destination,
+  tx = prisma,
+  now,
+  fetchFiatRate,
+  fetchCryptoUsdRate,
+}) => {
   const profile = await getOrCreateKycProfile(user);
   const limits = tierLimitsFor(profile.tier);
   const referenceCurrency = policyCurrency();
@@ -599,7 +587,7 @@ const enforceTransactionPolicy = async ({ user, amount, asset = 'NGN', routeType
     throw new Error(`This payment exceeds your tier ${profile.tier} daily limit.`);
   }
 
-  // Use new provider-based screening with full audit trail
+  // Use provider-based screening with full audit trail
   const sanctionsResult = await screenSanctions({
     user,
     destinationCountry,
@@ -621,13 +609,14 @@ const enforceTransactionPolicy = async ({ user, amount, asset = 'NGN', routeType
     asset: referenceCurrency,
     routeType,
     destinationCountry,
-    profileRiskScore: updatedProfile.riskScore,
+    profileRiskScore: profile.riskScore,
   });
-  if (riskScore >= 80) {
+
+  if (riskScore >= RISK_THRESHOLDS.CRITICAL_MIN) {
     throw new Error('This payment requires manual compliance review.');
   }
 
-  return { profile: updatedProfile, riskScore, policySnapshot };
+  return { profile, riskScore, policySnapshot, limits };
 };
 
 module.exports = {
@@ -637,6 +626,15 @@ module.exports = {
   startKycVerification,
   processSmileIdCallback,
   callbackDecision,
+  KYC_STATUSES,
+  SANCTIONS_STATUSES,
+  CUSTODY_STATUSES,
+  RISK_THRESHOLDS,
+  classifyRiskScore,
+  evaluateKycDecision,
+  getActivityLimits,
+  syncKycAndRiskState,
+  enforceWalletActivityLimit,
   PolicyError,
   POLICY_ERROR_CODES,
 };

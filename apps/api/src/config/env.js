@@ -1,6 +1,28 @@
 require('dotenv').config();
 
+const { resolveNetworkProfile } = require('./networkProfiles');
+
 const env = process.env.NODE_ENV || 'development';
+
+// Resolve the Stellar network as one coherent profile rather than trusting the
+// raw string. Problems are collected rather than thrown here so that
+// validateEnv can report every configuration fault in a single startup
+// failure; nothing downstream should read `stellar` before that check runs.
+const rawStellarNetwork = process.env.STELLAR_NETWORK || 'testnet';
+const stellarHorizonUrls = (process.env.HORIZON_URLS || '')
+  .split(',')
+  .map((u) => u.trim())
+  .filter(Boolean);
+const stellarAllowMainnet = String(process.env.STELLAR_ALLOW_MAINNET || '').toLowerCase() === 'true';
+
+const { profile: stellarProfile, problems: stellarNetworkProblems } = resolveNetworkProfile({
+  network: rawStellarNetwork,
+  horizonUrl: process.env.STELLAR_HORIZON_URL || null,
+  horizonUrls: stellarHorizonUrls,
+  usdcIssuer: process.env.STELLAR_USDC_ISSUER || null,
+  allowMainnet: stellarAllowMainnet,
+  enableFriendbot: String(process.env.STELLAR_ENABLE_FRIENDBOT || '').toLowerCase() === 'true',
+});
 
 module.exports = {
   port: process.env.PORT || 3002,
@@ -52,11 +74,9 @@ module.exports = {
     botWindowMs: Number(process.env.BOT_RATE_WINDOW_SEC || 60) * 1000,
     botMax: Number(process.env.BOT_RATE_MAX || 20),
   },
-  // Redis is the backbone of BullMQ queues, the WhatsApp DLQ and per-sender
-  // message ordering. These settings drive the connection policy in
-  // config/redis.js — TLS, reconnect backoff, command timeouts and Sentinel
-  // topology — so failures surface as metrics/alerts instead of silently
-  // dropping accepted work. See config/redis.js and the *.redis* tests.
+  proxy: {
+    trust: process.env.TRUST_PROXY || (env === 'production' ? '1' : 'false'),
+  },
   redis: {
     url: process.env.REDIS_URL || process.env.UPSTASH_REDIS_URL,
     ca: process.env.REDIS_CA,
@@ -125,17 +145,28 @@ module.exports = {
     r2SecretAccessKey: process.env.CLOUDDFLARE_R2_SECRET_ACCESS_KEY,
   },
   stellar: {
-    network: process.env.STELLAR_NETWORK || 'testnet',
-    horizonUrl: process.env.STELLAR_HORIZON_URL || 'https://horizon-testnet.stellar.org',
-    horizonUrls: (process.env.HORIZON_URLS || '')
-      .split(',')
-      .map((u) => u.trim())
-      .filter(Boolean),
+    // Canonical id when the network resolved; otherwise the raw value, so the
+    // startup error can quote back what was actually configured.
+    network: stellarProfile ? stellarProfile.id : rawStellarNetwork,
+    rawNetwork: rawStellarNetwork,
+    networkProfile: stellarProfile,
+    networkProblems: stellarNetworkProblems,
+    networkPassphrase: stellarProfile ? stellarProfile.passphrase : null,
+    allowMainnet: stellarAllowMainnet,
+    horizonUrl: process.env.STELLAR_HORIZON_URL
+      || (stellarProfile ? stellarProfile.defaultHorizonUrl : 'https://horizon-testnet.stellar.org'),
+    horizonUrls: stellarHorizonUrls,
     horizonTimeoutMs: Number(process.env.HORIZON_TIMEOUT_MS || 10000),
     horizonCircuitThreshold: Number(process.env.HORIZON_CIRCUIT_THRESHOLD || 3),
     horizonCircuitCooldownMs: Number(process.env.HORIZON_CIRCUIT_COOLDOWN_MS || 30000),
-    usdcIssuer: process.env.STELLAR_USDC_ISSUER || 'GBBD47IF6LWK7P7MDEVNCWR7DPUWV3NY3DT1QEVFL4NAT4AQ3HZLLFLA5',
-    isMainnet: (process.env.STELLAR_NETWORK || 'testnet') !== 'testnet',
+    usdcIssuer: process.env.STELLAR_USDC_ISSUER
+      || (stellarProfile ? stellarProfile.usdcIssuer : null),
+    explorerBaseUrl: stellarProfile ? stellarProfile.explorerBaseUrl : null,
+    supportsFriendbot: stellarProfile ? stellarProfile.supportsFriendbot : false,
+    // Fail closed: an unresolved network is never treated as mainnet, so a
+    // typo can no longer activate real-funds behaviour. Previously any value
+    // other than the literal 'testnet' selected the public network.
+    isMainnet: stellarProfile ? stellarProfile.isMainnet : false,
     auth: {
       signingKey: process.env.STELLAR_AUTH_SIGNING_KEY,
       homeDomain: process.env.STELLAR_HOME_DOMAIN,
@@ -183,25 +214,8 @@ module.exports = {
       secretKey: process.env.DOJAH_SECRET_KEY,
     },
     pinPepper: process.env.PIN_PEPPER,
-    // Tier single/daily limits are denominated in policyCurrency (NGN).
-    policyCurrency: (process.env.POLICY_CURRENCY || 'NGN').trim().toUpperCase(),
-    policyVersion: process.env.POLICY_VERSION || '1',
-    policyFxMaxAgeMs: Number(process.env.POLICY_FX_MAX_AGE_MS || 300000),
-    tierLimits: {
-      0: { daily: '0.00', single: '0.00' },
-      1: {
-        daily: process.env.TIER_1_DAILY_LIMIT || '50000.00',
-        single: process.env.TIER_1_SINGLE_LIMIT || '20000.00',
-      },
-      2: {
-        daily: process.env.TIER_2_DAILY_LIMIT || '500000.00',
-        single: process.env.TIER_2_SINGLE_LIMIT || '200000.00',
-      },
-      3: {
-        daily: process.env.TIER_3_DAILY_LIMIT || '5000000.00',
-        single: process.env.TIER_3_SINGLE_LIMIT || '1000000.00',
-      },
-    },
+    pinFailureLimit: Number(process.env.PIN_FAILURE_LIMIT || 5),
+    pinLockoutMs: Number(process.env.PIN_LOCKOUT_MS || 10 * 60 * 1000),
   },
   voice: {
     provider: process.env.VOICE_PROVIDER || 'deepgram',
@@ -234,8 +248,36 @@ module.exports = {
     // It must never be reachable in a real deployment by accident, so it
     // follows the same kill-switch pattern: OFF in production unless
     // explicitly set, ON elsewhere for local testing.
-    chatSim: process.env.ENABLE_CHAT_SIO
-	  ? process.env.ENABLE_CHAT_SIM === 'true'
+    chatSim: process.env.ENABLE_CHAT_SIM
+      ? process.env.ENABLE_CHAT_SIM === 'true'
       : env !== 'production',
+
+    // Secret rotation automation.
+    secretRotationCheckIntervalMs: Number(process.env.SECRET_ROTATION_CHECK_INTERVAL_MS || 0),
+    secretRotationWarningDays: Number(process.env.SECRET_ROTATION_WARNING_DAYS || 30),
+    secretRotationAlertWebhookUrl: process.env.SECRET_ROTATION_ALERT_WEBHOOK_URL || process.env.ERROR_MONITOR_WEBHOOK_URL,
+    secretRotationAlertToken: process.env.SECRET_ROTATION_ALERT_TOKEN || process.env.ERROR_MONITOR_TOKEN,
+  },
+  // ── Issue #228: Continuous alert delivery testing ────────────────────────
+  // Periodically sends synthetic test alerts through every configured alert
+  // route to verify end-to-end delivery and acknowledgement.
+  alertDeliveryTest: {
+    // How often to run a synthetic test (milliseconds). Default: 10 minutes.
+    intervalMs: Number(process.env.ALERT_DELIVERY_TEST_INTERVAL_MS || 10 * 60 * 1000),
+    // Optional secondary/fallback alert webhook URL.
+    // When the primary ERROR_MONITOR_WEBHOOK_URL fails, the test falls back here.
+    fallbackWebhookUrl: process.env.ALERT_DELIVERY_TEST_FALLBACK_URL || null,
+    // Optional bearer token for the fallback webhook.
+    fallbackWebhookToken: process.env.ALERT_DELIVERY_TEST_FALLBACK_TOKEN || null,
+    // Comma-separated list of additional webhook URLs to test (beyond primary + fallback).
+    extraRouteUrls: (process.env.ALERT_DELIVERY_TEST_EXTRA_URLS || '')
+      .split(',')
+      .map((u) => u.trim())
+      .filter(Boolean),
+    // HTTP timeout per delivery attempt (milliseconds). Default: 5 seconds.
+    timeoutMs: Number(process.env.ALERT_DELIVERY_TEST_TIMEOUT_MS || 5000),
+    // Multiplier applied to intervalMs to determine when a test is considered
+    // stale (missed). Default: 2 (i.e. flag when > 2× interval has elapsed).
+    staleMultiplier: Number(process.env.ALERT_DELIVERY_TEST_STALE_MULTIPLIER || 2),
   },
 };

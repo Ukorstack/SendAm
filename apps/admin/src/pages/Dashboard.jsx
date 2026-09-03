@@ -23,19 +23,19 @@ export default function Dashboard() {
         if (active) setStats(res.data);
       } catch (err) {
         // normalizeError ensures raw error.message / stack never reaches the UI
-        if (active) setError(normalizeError(err));
+        if (active) setError(`${normalizeError(err).userMessage} Request failed.`);
       } finally {
         if (active) setLoading(false);
       }
     };
-    fetchStats();
-    return () => { active = false; };
+    const timer = setTimeout(fetchStats, 0);
+    return () => { active = false; clearTimeout(timer); };
   }, [retryCount]);
 
   const handleRetry = useCallback(() => setRetryCount((c) => c + 1), []);
 
   if (loading) return <div className="flex justify-center py-20"><Loader size={32} /></div>;
-  if (error) return <div className="text-red-500 p-4 bg-red-50 rounded-lg" role="alert">{error}</div>;
+  if (error) return <div className="text-red-500 p-4 bg-red-50 rounded-lg" role="alert">{error}<button type="button" onClick={handleRetry} className="ml-3 underline">Try again</button></div>;
 
   return (
     <div className="min-w-0">
@@ -50,6 +50,36 @@ export default function Dashboard() {
         <StatCard title="Pending Txs" value={stats?.pendingTransactions || 0} icon={ArrowRightLeft} colorClass="text-amber-500" />
         <StatCard title="Pending KYC" value={stats?.pendingKyc || 0} icon={FileSearch} colorClass="text-indigo-500" />
       </div>
+
+      {Array.isArray(stats?.balances) && stats.balances.length > 0 && (
+        <div className="mt-8 sm:mt-12 bg-white p-5 sm:p-8 rounded-2xl border border-gray-100 shadow-sm overflow-x-auto">
+          <h2 className="text-lg font-bold mb-4">Settled Volume by Asset</h2>
+          <table className="w-full text-sm min-w-[480px]">
+            <thead>
+              <tr className="text-left text-gray-500 border-b border-gray-100">
+                <th className="py-2 pr-4 font-medium">Asset</th>
+                <th className="py-2 pr-4 font-medium">Amount</th>
+                <th className="py-2 pr-4 font-medium">{stats.balances[0].baseCurrency} equivalent</th>
+                <th className="py-2 font-medium">Rate source</th>
+              </tr>
+            </thead>
+            <tbody>
+              {stats.balances.map((row) => (
+                <tr key={row.asset} className="border-b border-gray-50 last:border-0">
+                  <td className="py-2 pr-4 font-medium">{row.asset}</td>
+                  <td className="py-2 pr-4">{Number(row.amount).toLocaleString(undefined, { minimumFractionDigits: row.precision ?? 2, maximumFractionDigits: row.precision ?? 2 })}</td>
+                  <td className="py-2 pr-4">
+                    {row.baseAmount != null
+                      ? Number(row.baseAmount).toLocaleString(undefined, { style: 'currency', currency: row.baseCurrency })
+                      : <span className="text-gray-400">unavailable</span>}
+                  </td>
+                  <td className="py-2 text-gray-500">{row.source}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
 
       <div className="mt-8 sm:mt-12 bg-white p-5 sm:p-8 rounded-2xl border border-gray-100 shadow-sm">
         <h2 className="text-lg font-bold mb-4">Welcome to SendAm Admin</h2>

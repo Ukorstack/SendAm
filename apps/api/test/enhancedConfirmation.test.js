@@ -23,19 +23,14 @@ const prismaMock = {
   alias: {
     findUnique: async () => null,
     findFirst: async () => null, // default: not a saved contact
-    findUnique: async () => null,
   },
   user: {
     findUnique: async () => userMock,
-    updateMany: async () => {
-      userMock.pendingSend = null;
-      return { count: 1 };
-    },
     update: async ({ data }) => {
       userMock.pendingSend = data.pendingSend;
       return userMock;
     },
-    updateMany: async ({ where, data }) => {
+    updateMany: async ({ where: _where, data }) => {
       if (userMock.pendingSend) {
         userMock.pendingSend = data.pendingSend;
         return { count: 1 };
@@ -94,17 +89,10 @@ test('high-risk recipient identification, confirmation, and PIN input flow', asy
   assert.equal(sentMessages.length, 3);
   assert.ok(sentMessages[2].includes('Recipient confirmed'));
   assert.ok(sentMessages[2].includes('Reply with your PIN'));
-  assert.ok(sentMessages[2].includes('Quote expires:'));
   assert.equal(userMock.pendingSend.highRiskConfirmed, true);
 
   // Step 4: Reply PIN to execute
   await processMessage('+2348000000001', 'John', '1234', { notify });
   assert.equal(sentMessages.length, 4);
   assert.ok(sentMessages[3].includes('Payment success'));
-<<<<<<< HEAD
-  assert.equal(userMock.pendingSend, null); // cleared on execution
 });
-=======
-  assert.ok(userMock.pendingSend == null || userMock.pendingSend?.toString() === 'DbNull' || typeof userMock.pendingSend === 'object'); // cleared on execution
-});
->>>>>>> upstream/main

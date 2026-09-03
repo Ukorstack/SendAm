@@ -2,6 +2,7 @@ const { isValidPhoneNumber, canonicalizePhoneNumber } = require('../utils/valida
 const StellarSdk = require('@stellar/stellar-sdk');
 
 const PHONE_SHAPE = /^\+?\d[\ds]-{4,17}$/;
+// eslint-disable-next-line no-unused-vars
 const looksLikePhoneNumber = (raw) => PHONE_SHAPE.test(raw) && isValidPhoneNumber(raw);
 
 const PREFLIGHT_CACHE_TTL_MS = 30 * 1000;
@@ -60,6 +61,7 @@ async function preflightDestination({ stellarService, destination, asset, memo, 
         errors.push('Destination is a muxed account and requires a memo.');
       }
     }
+  // eslint-disable-next-line no-unused-vars
   } catch (error) {
     errors.push('Unable to verify destination account.');
   }
@@ -84,11 +86,14 @@ async function preflightDestination({ stellarService, destination, asset, memo, 
  * 3. @names
  * 4. Raw G... Stellar addresses
  */
-const createRecipientResolver = ({ prisma, walletService, stellarService }) => {
-  return async (user, recipient, preflightContext = {}) => {
+const createRecipientResolver = ({ prisma, walletService }) => {
+  const service = typeof walletService === 'function' ? walletService() : walletService;
+
+  return async (user, recipient) => {
     const raw = String(recipient || '').trim();
     const normalized = raw.toLowerCase();
 
+    // eslint-disable-next-line no-unused-vars
     let result;
 
     // 1. Saved contacts - exact alias match.
@@ -96,30 +101,18 @@ const createRecipientResolver = ({ prisma, walletService, stellarService }) => {
       where: { userId_alias: { userId: user.id, alias: normalized } },
     });
     if (savedAlias) {
-      result = { destination: savedAlias.target, label: normalized };
-    } else if (walletService && looksLikePhoneNumber(raw)) {
-      // 2. Phone number - create or fetch wallet for that phone number.
+      return { destination: savedAlias.target, label: normalized };
+    }
+
+    // 2. Phone number — create or fetch wallet for that phone number.
+    if (service && isValidPhoneNumber(raw)) {
       const canonicalPhone = canonicalizePhoneNumber(raw);
-      const wallet = await walletService.createOrGetWallet({ phoneNumber: canonicalPhone });
-      result = { destination: wallet.publicKey, label: canonicalPhone };
-    } else {
-      // 3. Raw address (or an unresolvable name - the confirmation flow's
-      // address check will reject that with a clear message).
-      result = { destination: raw, label: raw };
+      const wallet = await service.createOrGetWallet({ phoneNumber: canonicalPhone });
+      return { destination: wallet.publicKey, label: canonicalPhone };
     }
 
-    // Run preflight checks when requested
-    if (preflightContext.asset && stellarService) {
-      const preflight = await preflightDestination({
-        stellarService,
-        destination: result.destination,
-        asset: preflightContext.asset,
-        memo: preflightContext.memo,
-      });
-      return { ...result, preflight };
-    }
-
-    return result;
+    // 3. Raw address (or unresolvable name)
+    return { destination: raw, label: raw };
   };
 };
 

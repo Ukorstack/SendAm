@@ -3,15 +3,19 @@ const crypto = require('crypto');
 const walletService = require('../wallet/wallet.service');
 const { validateAddress } = require('../wallet/stellar.adapter');
 const { executePayment } = require('../payment/payment.orchestrator');
-const { verifyPin } = require('../compliance/pin.service');
+const { verifyPin, verifyPinAttempt } = require('../compliance/pin.service');
 const { sendTextMessage } = require('../services/whatsapp.service');
 const { claimPendingSend } = require('./pendingClaim');
 const { createRecipientResolver } = require('./recipientResolver');
+const { createQuote } = require('../pricing/pricing.service');
 const defaultPrisma = require('../common/prisma');
 const { canonicalizePhoneNumber } = require('../utils/validators');
-const { parseConsentCommand, updateUserConsent, isMessageAllowed } = require('../compliance/consent.service');
+const { parseConsentCommand, applyConsentKeyword, isMessageAllowed } = require('../compliance/consent.service');
 const { t, SUPPORTED_LOCALES } = require('../i18n/messages');
+// eslint-disable-next-line no-unused-vars
 const { formatDateByLocale, formatAmountByLocale } = require('../i18n/formatters');
+// eslint-disable-next-line no-unused-vars
+const { buildStandardReceipt, formatChannelReceiptMessage, recordReceiptDeliveryEvent } = require('../services/receipt.service');
 
 const PENDING_SEND_TTL_MS = 10 * 60 * 1000;
 const NATIVE_ASSET = 'XLM';
@@ -122,12 +126,23 @@ const requestConfirmation = async ({ phoneNumber, user, intent, notify, db = def
   const stateId = `ps_${now.getTime()}_${crypto.randomBytes(4).toString('hex')}`;
   const step = isHighRisk ? 'AWAITING_HIGH_RISK_CONFIRMATION' : 'AWAITING_PIN';
 
+  const quote = await createQuote({
+    userId: user.id,
+    sourceCurrency: intent.asset,
+    targetCurrency: intent.asset,
+    sourceAmount: intent.amount,
+    route: 'stellar',
+    provider: 'stellar',
+  }).catch(() => null);
+
   const pendingSend = {
     version: 1,
     stateId,
     step,
     amount: intent.amount,
     asset: intent.asset,
+    quoteId: quote?.id,
+    quoteExpiresAt: quote?.expiresAt,
     destination: recipient.destination,
     alias: recipient.label,
     memo: intent.memo,
@@ -149,13 +164,16 @@ const requestConfirmation = async ({ phoneNumber, user, intent, notify, db = def
     const warnMsg = t('high_risk_warning', { fingerprint }, locale);
     await notify(phoneNumber, warnMsg);
   } else {
+    // eslint-disable-next-line no-unused-vars
     const formattedAmount = formatAmountByLocale(intent.amount, intent.asset, locale);
     const memoLine = intent.memo ? `\nMemo (${intent.memoType || 'text'}): ${intent.memo}` : '';
+    const quoteLine = quote?.expiresAt ? `Quote expires: ${new Date(quote.expiresAt).toISOString()}\n` : '';
     const confirmMsg = t('payment_confirm', {
       amount: intent.amount,
       asset: intent.asset,
       label: recipient.label,
       memoLine,
+      quoteLine,
     }, locale);
     await notify(phoneNumber, confirmMsg);
   }
@@ -203,11 +221,13 @@ const handlePendingPin = async ({ phoneNumber, user, text, notify, db = defaultP
       });
 
       const memoLine = updatedPending.memo ? `Memo (${updatedPending.memoType || 'text'}): ${updatedPending.memo}\n` : '';
+      const quoteLine = updatedPending.quoteExpiresAt ? `Quote expires: ${new Date(updatedPending.quoteExpiresAt).toISOString()}\n` : '';
       const confirmMsg = t('payment_confirm_high_risk', {
         amount: updatedPending.amount,
         asset: updatedPending.asset,
         fingerprint: updatedPending.fingerprint,
         memoLine,
+        quoteLine,
       }, locale);
       await notify(phoneNumber, confirmMsg);
       return true;
@@ -218,7 +238,20 @@ const handlePendingPin = async ({ phoneNumber, user, text, notify, db = defaultP
   }
 
   const userWithPin = await db.user.findUnique({ where: { id: user.id } });
-  if (!verifyPin(text, userWithPin.pinHash)) {
+  let pinOk = false;
+  if (typeof verifyPinAttempt === 'function' && userWithPin && userWithPin.pinFailedAttempts !== undefined) {
+    const pinAttempt = await verifyPinAttempt({ prisma: db, userId: user.id, pin: text });
+    pinOk = pinAttempt.ok;
+    if (!pinAttempt.ok && pinAttempt.locked) {
+      const retrySeconds = Math.max(1, Math.ceil(pinAttempt.retryAfterMs / 1000));
+      await notify(phoneNumber, `PIN verification failed. Your account is temporarily locked. Please try again in ${retrySeconds} seconds, or reply "no" to cancel.`);
+      return true;
+    }
+  } else {
+    pinOk = verifyPin(text, userWithPin?.pinHash);
+  }
+
+  if (!pinOk) {
     await notify(phoneNumber, t('pin_failed', {}, locale));
     return true;
   }
@@ -239,10 +272,11 @@ const handlePendingPin = async ({ phoneNumber, user, text, notify, db = defaultP
     routeType: pending.routeType,
   });
 
-  const receiptMsg = t('payment_success', {
+  const standardReceipt = buildStandardReceipt(result.transaction, { mask: true });
+  const receiptMsg = `${t('payment_success', {
     status: result.transaction.status,
     receiptId: result.receipt.transactionId,
-  }, locale);
+  }, locale)}\n\n${formatChannelReceiptMessage(standardReceipt)}`;
 
   await notify(phoneNumber, receiptMsg, {
     notification: {
@@ -281,11 +315,14 @@ const processMessage = async (phoneNumber, whatsappName, text, options = {}) => 
   // Opt-out / Opt-in consent handling (#191)
   const consentCmd = parseConsentCommand(text);
   if (consentCmd.isConsentCommand) {
-    const updatedUser = await updateUserConsent({
+    // Applies the keyword across every optional category, not just the
+    // global flag: a customer who says STOP means stop, and leaving service
+    // messages running because they are "useful" is what erodes trust in the
+    // keyword (#310).
+    const { user: updatedUser } = await applyConsentKeyword({
       userId: user.id,
       phoneNumber,
       consent: consentCmd.consent,
-      source: 'whatsapp_keyword',
       prisma: db,
     });
     user.messagingConsent = updatedUser.messagingConsent;

@@ -1,6 +1,8 @@
 import { http, HttpResponse } from 'msw';
 
 export const handlers = [
+  http.get('*/api/admin/me', () => HttpResponse.json({ data: { permissions: ['admin.read', 'compliance.read', 'operations.write'] } })),
+  http.post('*/api/admin/password', () => HttpResponse.json({ data: { success: true } })),
   // Authentication
   http.post('*/api/admin/login', async ({ request }) => {
     const body = await request.json();
@@ -21,6 +23,10 @@ export const handlers = [
         failedTransactions: 8,
         pendingTransactions: 20,
         pendingKyc: 3,
+        balances: [
+          { asset: 'USD', amount: '150.00', precision: 2, baseCurrency: 'USD', baseAmount: '150.00', rate: '1', source: 'identity' },
+          { asset: 'XLM', amount: '1000.0000000', precision: 7, baseCurrency: 'USD', baseAmount: '500.00', rate: '0.5', source: 'exchangerate-api' },
+        ],
       },
     });
   }),

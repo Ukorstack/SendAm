@@ -1,6 +1,7 @@
 const { sendSuccess, sendError, sendCursorPaginated } = require('../utils/response');
 const { authenticate, createInvitation, acceptInvitation, revokeSessions, hashPassword, changeOwnPassword } = require('../services/adminAuth.service');
 const { writeAuditLog } = require('../common/audit.service');
+// eslint-disable-next-line no-unused-vars
 const { appendEvent, EVENT_TYPES, queryEvents, verifyEventChain: verifyEventChainService } = require('../common/event.service');
 const { deactivateAccount, reactivateAccount, getAccountStatusHistory, DEACTIVATION_REASONS } = require('../compliance/account.service');
 const { getOnboardingStatus } = require('../compliance/onboarding.service');
@@ -9,11 +10,21 @@ const prisma = require('../common/prisma');
 const { withIdAliases } = require('../common/records');
 const { parseLimit, cursorQuery, MAX_EXPORT_ROWS } = require('../utils/cursorPagination');
 const { listStuckPayments, operatorResolveStuckPayment, listLedgerDiscrepancies } = require('../payment/payment.reconciler');
+const { getWalletActivitySummary } = require('../services/wallet-activity-summary.service');
+const walletService = require('../wallet/wallet.service');
+// eslint-disable-next-line no-unused-vars
+const { getRotationStatus, rotateSecret: performSecretRotation, evaluateRotationHealth, SECRET_CATEGORIES } = require('../services/secret-rotation.service');
+// eslint-disable-next-line no-unused-vars
+const { walletDto, transactionDto, kycProfileDto } = require('../admin/adminDtos');
+const { getExchangeRate } = require('../pricing/pricing.service');
+const { getAssetRule } = require('../utils/money');
+const { getAlertDeliveryTestStatus } = require('../observability/alertDeliveryTest.service');
+const config = require('../config/env');
 
 // Build an inclusive [gte, lte] range from `from`/`to` query params. Tolerant of
 // bare dates ("2024-01-01") and full ISO timestamps; invalid input is ignored
 // so a bad filter never returns a hard error.
-const parseDateRange = (query, field = 'createdAt') => {
+const  parseDateRange = (query, field = 'createdAt') => {
   const { from, to, [field]: fieldRange } = query;
   const start = from || (fieldRange ? fieldRange.split(',')[0] : null);
   const end = to || (fieldRange ? fieldRange.split(',')[1] : null);
@@ -85,6 +96,7 @@ const auditWhere = (query) => {
   const where = {};
   if (query.action) where.action = { equals: query.action };
   if (query.actorType) where.actorType = { equals: query.actorType };
+  if (query.actorId) where.actorId = { equals: query.actorId };
   if (query.entityType) where.entityType = { equals: query.entityType };
   Object.assign(where, parseDateRange(query, 'createdAt'));
   Object.assign(where, identifierWhere(query.identifier, ['id', 'entityId']));
@@ -227,6 +239,54 @@ const me = async (req, res, next) => {
   } catch (error) { return next(error); }
 };
 
+// Unified balance/valuation summary. Totals settled volume per asset, plus a
+// best-effort conversion to a single base currency so operators can compare
+// wallets holding different assets. Each row carries the FX source and
+// precision so a stale or unavailable rate is visible rather than silently
+// wrong. `baseAmount` stays null when no rate can be sourced.
+const BALANCE_SUMMARY_BASE_CURRENCY = 'USD';
+
+const getBalanceSummary = async () => {
+  const rows = await prisma.$queryRaw`
+    SELECT "asset", SUM("amount"::numeric)::text AS total
+    FROM "Transaction"
+    WHERE "status" = 'success'
+    GROUP BY "asset"
+  `;
+
+  return Promise.all(rows.map(async ({ asset, total }) => {
+    let rule;
+    try {
+      rule = getAssetRule(asset);
+    } catch {
+      return { asset, amount: total, precision: null, baseCurrency: BALANCE_SUMMARY_BASE_CURRENCY, baseAmount: null, rate: null, source: 'unsupported_asset' };
+    }
+
+    const amount = Number(total).toFixed(rule.precision);
+    if (asset === BALANCE_SUMMARY_BASE_CURRENCY) {
+      return { asset, amount, precision: rule.precision, baseCurrency: BALANCE_SUMMARY_BASE_CURRENCY, baseAmount: amount, rate: '1', source: 'identity' };
+    }
+
+    let rate = null;
+    try {
+      rate = await getExchangeRate({ sourceCurrency: asset, targetCurrency: BALANCE_SUMMARY_BASE_CURRENCY });
+    } catch {
+      rate = null;
+    }
+    const baseAmount = rate != null ? (Number(amount) * Number(rate)).toFixed(getAssetRule(BALANCE_SUMMARY_BASE_CURRENCY).precision) : null;
+
+    return {
+      asset,
+      amount,
+      precision: rule.precision,
+      baseCurrency: BALANCE_SUMMARY_BASE_CURRENCY,
+      baseAmount,
+      rate,
+      source: rate != null ? 'exchangerate-api' : 'unavailable',
+    };
+  }));
+};
+
 const getStats = async (req, res, next) => {
   try {
     const [
@@ -238,6 +298,7 @@ const getStats = async (req, res, next) => {
       pendingTransactions,
       pendingKyc,
       voiceCommands,
+      balances,
     ] = await Promise.all([
       prisma.user.count(),
       prisma.wallet.count(),
@@ -247,6 +308,7 @@ const getStats = async (req, res, next) => {
       prisma.transaction.count({ where: { status: { in: ['pending', 'processing'] } } }),
       prisma.kycProfile.count({ where: { status: { in: ['pending', 'review'] } } }),
       prisma.voiceCommand.count(),
+      getBalanceSummary(),
     ]);
 
     sendSuccess(res, {
@@ -258,6 +320,7 @@ const getStats = async (req, res, next) => {
       pendingTransactions,
       pendingKyc,
       voiceCommands,
+      balances,
     });
   } catch (error) {
     next(error);
@@ -425,6 +488,49 @@ const exportKyc = async (req, res, next) => {
   } catch (error) { return next(error); }
 };
 
+// Full identifiers are available only through an explicit, permission-gated,
+// single-record action. The response expires quickly and every reveal is
+// recorded. Secrets and raw provider metadata are never revealable.
+const revealSensitiveFields = async (req, res, next) => {
+  try {
+    const { resource, id } = req.params;
+    const queries = {
+      user: () => prisma.user.findUnique({ where: { id }, select: { phoneNumber: true, whatsappName: true } }),
+      wallet: () => prisma.wallet.findUnique({ where: { id }, select: { publicKey: true, phoneNumber: true } }),
+      transaction: () => prisma.transaction.findUnique({
+        where: { id },
+        select: { destination: true, recipientPhoneNumber: true, txHash: true, providerTransactionId: true },
+      }),
+      kyc: () => prisma.kycProfile.findUnique({
+        where: { id },
+        select: { providerReference: true, deniedReason: true },
+      }),
+    };
+    if (!queries[resource]) return sendError(res, 'Unsupported reveal resource', 400);
+    const fields = await queries[resource]();
+    if (!fields) return sendError(res, 'Record not found', 404);
+
+    await writeAuditLog({
+      actorType: 'admin',
+      actorId: req.admin?.role,
+      action: 'admin.sensitive.revealed',
+      entityType: resource,
+      entityId: id,
+      metadata: { fields: Object.keys(fields) },
+      req,
+    });
+
+    return sendSuccess(res, {
+      resource,
+      id,
+      fields,
+      validUntil: new Date(Date.now() + 60_000).toISOString(),
+    }, 'Sensitive fields revealed for this response only');
+  } catch (error) {
+    next(error);
+  }
+};
+
 const exportAuditLogs = async (req, res, next) => {
   try {
     const where = auditWhere(req.query);
@@ -467,6 +573,17 @@ const getSystemHealth = async (_req, res, next) => {
       custodyModel: 'direct',
       timestamp: new Date().toISOString(),
     });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// ── Issue #228: Alert delivery test status ───────────────────────────────────
+
+const getAlertDeliveryTestStatusHandler = async (_req, res, next) => {
+  try {
+    const status = getAlertDeliveryTestStatus(config);
+    return sendSuccess(res, status);
   } catch (error) {
     next(error);
   }
@@ -524,6 +641,61 @@ const getLedgerDiscrepancies = async (req, res, next) => {
     return sendSuccess(res, report);
   } catch (error) {
     next(error);
+  }
+};
+
+const getWalletSummary = async (req, res, next) => {
+  try {
+    const summary = await getWalletActivitySummary({
+      userId: req.query.userId,
+      phoneNumber: req.query.phone,
+      windowDays: req.query.windowDays,
+      requestingAdminId: req.admin?.id || 'system',
+    });
+    return sendSuccess(res, summary);
+  } catch (error) {
+    if (error.statusCode) return sendError(res, error.message, error.statusCode);
+    return next(error);
+  }
+};
+
+const recoverWallet = async (req, res, next) => {
+  try {
+    const result = await walletService.recoverWallet({
+      walletId: req.params.id,
+      adminId: req.admin?.id || 'system',
+    });
+    return sendSuccess(res, { wallet: result }, 'Wallet recovery initiated');
+  } catch (error) {
+    if (error.statusCode) return sendError(res, error.message, error.statusCode);
+    return next(error);
+  }
+};
+
+const getSecretRotationStatus = async (req, res, next) => {
+  try {
+    const status = await getRotationStatus();
+    return sendSuccess(res, status);
+  } catch (error) {
+    next(error);
+  }
+};
+
+const rotateSecret = async (req, res, next) => {
+  try {
+    const category = req.body?.category;
+    if (!category || !SECRET_CATEGORIES[category]) {
+      return sendError(res, `Invalid secret category. Supported: ${Object.keys(SECRET_CATEGORIES).join(', ')}`, 400);
+    }
+    const result = await performSecretRotation({
+      category,
+      newValue: req.body?.newValue,
+      rotatedBy: req.admin?.id || 'system',
+    });
+    return sendSuccess(res, result, 'Secret rotation completed', 201);
+  } catch (error) {
+    if (error.statusCode) return sendError(res, error.message, error.statusCode);
+    return next(error);
   }
 };
 
@@ -748,6 +920,153 @@ const getUserAccountStatusHistory = async (req, res, next) => {
   }
 };
 
+const { buildStatementData, exportStatementCsv, exportStatementPdf } = require('../wallet/statement.service');
+
+const getUserStatement = async (req, res, next) => {
+  try {
+    const { startDate, endDate, asset, format = 'json' } = req.query;
+    const userId = req.params.userId;
+
+    if (format === 'csv') {
+      const { csv, statementId } = await exportStatementCsv({
+        userId,
+        startDate,
+        endDate,
+        asset,
+        actingActor: { type: 'administrator', id: req.admin.id },
+        req,
+      });
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="statement-${userId}-${statementId}.csv"`);
+      return res.status(200).send(csv);
+    }
+
+    if (format === 'pdf') {
+      const { pdfBuffer, statementId } = await exportStatementPdf({
+        userId,
+        startDate,
+        endDate,
+        asset,
+        actingActor: { type: 'administrator', id: req.admin.id },
+        req,
+      });
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="statement-${userId}-${statementId}.pdf"`);
+      return res.status(200).send(pdfBuffer);
+    }
+
+    const statement = await buildStatementData({
+      userId,
+      startDate,
+      endDate,
+      asset,
+    });
+
+    return sendSuccess(res, statement, 'Customer account statement generated');
+  } catch (error) {
+    if (error.statusCode) return sendError(res, error.message, error.statusCode);
+    next(error);
+  }
+};
+
+const getKycExpiryStatus = async (req, res, next) => {
+  try {
+    const { getVerificationExpiryStatus } = require('../compliance/verification.expiry');
+    const profile = await prisma.kycProfile.findUnique({
+      where: { id: req.params.id },
+    });
+    if (!profile) return sendError(res, 'KYC profile not found', 404);
+    return sendSuccess(res, getVerificationExpiryStatus(profile));
+  } catch (error) {
+    next(error);
+  }
+};
+
+const getComplianceExpirySummary = async (req, res, next) => {
+  try {
+    const { isSanctionExpired, isKycStale, isEscalationDue } = require('../compliance/verification.expiry');
+    const profiles = await prisma.kycProfile.findMany({
+      where: { status: { in: ['approved', 'not_started'] } },
+      select: {
+        id: true,
+        status: true,
+        updatedAt: true,
+        lastScreenedAt: true,
+        sanctionsStatus: true,
+        metadata: true,
+        user: { select: { anonymizedAt: true } },
+      },
+    });
+
+    const active = profiles.filter((p) => !p.user?.anonymizedAt);
+    const summary = {
+      total: active.length,
+      sanctionExpired: active.filter(isSanctionExpired).length,
+      kycStale: active.filter(isKycStale).length,
+      escalationDue: active.filter(isEscalationDue).length,
+      missingVerification: active.filter((p) => p.status === 'not_started').length,
+    };
+
+    return sendSuccess(res, summary);
+  } catch (error) {
+    next(error);
+  }
+};
+
+const {
+  listDeadLetterJobs,
+  getDeadLetterJob,
+  replayDeadLetterJob: replayDlqJob,
+  discardDeadLetterJob: discardDlqJob,
+} = require('../queues/dlq.service');
+
+const getDeadLetterJobs = async (req, res, next) => {
+  try {
+    const { status, limit } = req.query;
+    const jobs = await listDeadLetterJobs({
+      status,
+      limit: limit ? Number(limit) : 50,
+    });
+    return sendSuccess(res, { jobs });
+  } catch (error) {
+    next(error);
+  }
+};
+
+const getDeadLetterJobById = async (req, res, next) => {
+  try {
+    const job = await getDeadLetterJob(req.params.id);
+    if (!job) return sendError(res, 'Dead letter job not found', 404);
+    return sendSuccess(res, { job });
+  } catch (error) {
+    next(error);
+  }
+};
+
+const replayDeadLetterJobHandler = async (req, res, next) => {
+  try {
+    const adminId = req.admin?.id || 'system';
+    const result = await replayDlqJob(req.params.id, {
+      actorId: adminId,
+    });
+    return sendSuccess(res, result, 'Dead letter job replay processed');
+  } catch (error) {
+    next(error);
+  }
+};
+
+const discardDeadLetterJobHandler = async (req, res, next) => {
+  try {
+    const adminId = req.admin?.id || 'system';
+    const result = await discardDlqJob(req.params.id, {
+      actorId: adminId,
+    });
+    return sendSuccess(res, result, 'Dead letter job discarded');
+  } catch (error) {
+    next(error);
+  }
+};
+
 module.exports = {
   login,
   acceptInvite,
@@ -777,19 +1096,31 @@ module.exports = {
   escalateStuckPayment: actOnStuckPayment('escalate'),
   getLedgerDiscrepancies,
   verifyAuditLogs,
-  // #318 – Event ledger
+  getWalletSummary,
+  recoverWallet,
+  getSecretRotationStatus,
+  rotateSecret,
+  revealSensitiveFields,
   getWorkflowEvents,
   verifyEventChain,
   exportWorkflowEvents,
-  // #329 – Compliance evidence exports
   getUserEvidencePackage,
   downloadUserEvidencePackage,
   exportKycEvidence,
   exportAccountStatusHistory,
-  // #330 – Onboarding status
   getUserOnboardingStatus,
-  // #332 – Account deactivation/reactivation
   deactivateUserAccount,
   reactivateUserAccount,
   getUserAccountStatusHistory,
+  getUserStatement,
+  getKycExpiryStatus,
+  getComplianceExpirySummary,
+  getDeadLetterJobs,
+  getDeadLetterJobById,
+  replayDeadLetterJob: replayDeadLetterJobHandler,
+  discardDeadLetterJob: discardDeadLetterJobHandler,
+  getAlertDeliveryTestStatus: getAlertDeliveryTestStatusHandler,
 };
+
+
+
